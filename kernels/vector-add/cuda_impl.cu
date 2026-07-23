@@ -1,23 +1,29 @@
 #include <cuda_runtime.h>
+
 #include <iostream>
+
 #include <cmath>
 #include <math.h>
 
-// simple kernel func to add elements of two vectors
+
+
+// basic simple kernel func to add elements of two vectors
 __global__ 
-void add_basic(const float *a, const float *b, float *c, int n) {
+void add_basic(const float *x, const float *y, float *z, int n) {
     
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if(index < n) {
-        c[index] = a[index] + b[index];
+        z[index] = x[index] + y[index];
 
     }
 }
-void launch_add_basic(const float *a, const float *b, float *c, int n) {
-    constexpr int threads_per_block = 256;
+void launch_add_basic(const float *x, const float *y, float *z, int n,
+                      int threads_per_block) {
     int blocks = (n + threads_per_block - 1) / threads_per_block;
-    add_basic <<<blocks, threads_per_block>>>(a, b, c, n);
+    add_basic<<<blocks, threads_per_block>>>(x, y, z, n);
 }
+
+
 
 
 
@@ -31,8 +37,8 @@ void add_gridnstride(const float* x, const float *y, float *z, int n) {
         z[i] = x[i] + y[i];
     }
 }
-void launch_add_gridnstride(const float *x, const float *y, float *z, int n) {
-    constexpr int threads_per_block = 256;
+void launch_add_gridnstride(const float *x, const float *y, float *z, int n,
+                            int threads_per_block) {
     cudaDeviceProp properties;
     cudaGetDevice(&device);
     cudaGetDeviceProperties(&properties, device);
@@ -43,6 +49,8 @@ void launch_add_gridnstride(const float *x, const float *y, float *z, int n) {
 
 
 
+
+
 //vectorized version using float4
 __global__
 void add_float4(const float* x, const float *y, float *z, int n) {
@@ -50,30 +58,33 @@ void add_float4(const float* x, const float *y, float *z, int n) {
     int vector_count / 4;
 
     if (index < vector_count) {
-        const float4* a4 = reinterpret_cast<const float4*>(a);
-        const float4* b4 = reinterpret_cast<const float4*>(b);
-        float4* c4 = reinterpret_cast<float4*>(c);
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        const float4* y4 = reinterpret_cast<const float4*>(y);
+        float4* z4 = reinterpret_cast<float4*>(z);
 
-        float4 av = a4[index];
-        float4 bv = b4[index];
+        float4 xv = x4[index];
+        float4 yv = y4[index];
 
-        c4[index] = make_float4(
-            av.x + bv.x,
-            av.y + bv.y,
-            av.z + bv.z,
-            av.w + bv.w
+        z4[index] = make_float4(
+            xv.x + yv.x,
+            xv.y + yv.y,
+            xv.z + yv.z,
+            xv.w + yv.w
         );
+
+        // Handle N values that are not divisible by four
         int tail_start = vector_count * 4;
         int tail_size = n - tail_start;
 
         if (index < tail_size) {
             int tail_index = tail_start + index;
-            c[tail_index] = a[tail_index] + b[tail_index];
+            z[tail_index] = x[tail_index] + y[tail_index];
         }
     }
 }
-void launch_add_float4(const float *x, const float *y, float *z, int n) {
-    constexpr int threads_per_block = 256;
+void launch_add_float4(const float *x, const float *y, float *z, int n,
+                        int threads_per_block) {
+
     int vector_count = n/4;
     int work_items = vector_count > 0 ? vector_count : 1;
     int blocks = (work_items + threads_per_block - 1) / threads_per_block;
@@ -84,79 +95,80 @@ void launch_add_float4(const float *x, const float *y, float *z, int n) {
 
 
 
-int main(void)
-{
-    int N = 1 << 20;
-
-    float* x;
-    float* y;
-
-    cudaMallocManaged(&x, N * sizeof(float));
-    cudaMallocManaged(&y, N * sizeof(float));
-
-    for (int i = 0; i < N; ++i) {
-        x[i] = 1.0f;
-        y[i] = 2.0f;
-    }
-
-    int threads = 256;
-    int blocks = (N + threads - 1) / threads;
-
-    // 1. Basic CUDA kernel
-    add_basic<<<blocks, threads>>>(N, x, y);
-    cudaDeviceSynchronize();
-
+float max_error(const float *result, int n) {
     float maxError = 0.0f;
 
-    for (int i = 0; i < N; ++i) {
-        maxError = std::fmax(maxError, std::fabs(y[i] - 3.0f));
+    for (int i = 0; i < n; ++i) {
+        maxError = std::fmax(
+            maxError,
+            std::fabs(result[i] - 3.0f)
+        );
     }
 
-    std::cout << "Basic CUDA max error: "
-              << maxError << '\n';
+    return maxError;
+}
 
-    // Reset y before running the next kernel.
-    for (int i = 0; i < N; ++i) {
+
+
+int main(int argc, char** argv) {
+
+    int N = argc > 1 ? std::atoi(argv[1]) : (1 << 20);
+    int threads_per_block = argc > 2 ? std::atoi(argv[2]) : 256;
+
+    if (N <= 0 || threads_per_block <= 0) {
+        std::cerr << "N and block size must be pos\n";
+        return 1;
+    }
+
+    float *x;
+    float *y;
+    float *z;
+
+    std::size_t bytes = static_cast<std::size_t>(N) * sizeof(float);
+
+    cudaMallocManaged(&x, bytes);
+    cudaMallocManaged(&y, bytes);
+    cudaMallocManaged(&z, bytes);
+
+    for (int i = 0; i<N; ++i) {
+        x[i] = 1.0f;
         y[i] = 2.0f;
+        z[i] = 0.0f;
     }
 
-    // 2. Grid-stride kernel
-    add_grid_stride<<<blocks, threads>>>(N, x, y);
+    std::cout
+            << "N: " << N
+            << ", block size: " << threads_per_block
+            << "\n";
+
+    
+    // Basic simple kernel
+    launch_add_basic(x, y, z, N, threads_per_block);
     cudaDeviceSynchronize();
+    std::cout
+            << "Basic kernel max error: "
+            << max_error(z, N)
+            << "\n";
 
-    maxError = 0.0f;
-
-    for (int i = 0; i < N; ++i) {
-        maxError = std::fmax(maxError, std::fabs(y[i] - 3.0f));
-    }
-
-    std::cout << "Grid-stride max error: "
-              << maxError << '\n';
-
-    // Reset y again.
-    for (int i = 0; i < N; ++i) {
-        y[i] = 2.0f;
-    }
-
-    // 3. float4 kernel
-    int float4Elements = N / 4;
-    int float4Blocks =
-        (float4Elements + threads - 1) / threads;
-
-    add_float4<<<float4Blocks, threads>>>(N, x, y);
+    // grid - stride loop kernel
+    launch_add_gridnstride(x, y, z, N, threads_per_block);
     cudaDeviceSynchronize();
+    std::cout
+            << "Grid-stride kernel max error: "
+            << max_error(z, N)
+            << "\n";
 
-    maxError = 0.0f;
-
-    for (int i = 0; i < N; ++i) {
-        maxError = std::fmax(maxError, std::fabs(y[i] - 3.0f));
-    }
-
-    std::cout << "float4 max error: "
-              << maxError << '\n';
+    // float4 kernel
+    launch_add_float4(x, y, z, N, threads_per_block);
+    cudaDeviceSynchronize();
+    std::cout
+            << "float4 kernel max error: "
+            << max_error(z, N)
+            << "\n";
 
     cudaFree(x);
     cudaFree(y);
+    cudaFree(z);
 
     return 0;
 }
