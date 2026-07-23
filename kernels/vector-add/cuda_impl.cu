@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <iostream>
+#include <cmath>
 #include <math.h>
 
 // simple kernel func to add elements of two vectors
@@ -81,4 +82,81 @@ void launch_add_float4(const float *x, const float *y, float *z, int n) {
 
 
 
-int main() {}
+
+
+int main(void)
+{
+    int N = 1 << 20;
+
+    float* x;
+    float* y;
+
+    cudaMallocManaged(&x, N * sizeof(float));
+    cudaMallocManaged(&y, N * sizeof(float));
+
+    for (int i = 0; i < N; ++i) {
+        x[i] = 1.0f;
+        y[i] = 2.0f;
+    }
+
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+
+    // 1. Basic CUDA kernel
+    add_basic<<<blocks, threads>>>(N, x, y);
+    cudaDeviceSynchronize();
+
+    float maxError = 0.0f;
+
+    for (int i = 0; i < N; ++i) {
+        maxError = std::fmax(maxError, std::fabs(y[i] - 3.0f));
+    }
+
+    std::cout << "Basic CUDA max error: "
+              << maxError << '\n';
+
+    // Reset y before running the next kernel.
+    for (int i = 0; i < N; ++i) {
+        y[i] = 2.0f;
+    }
+
+    // 2. Grid-stride kernel
+    add_grid_stride<<<blocks, threads>>>(N, x, y);
+    cudaDeviceSynchronize();
+
+    maxError = 0.0f;
+
+    for (int i = 0; i < N; ++i) {
+        maxError = std::fmax(maxError, std::fabs(y[i] - 3.0f));
+    }
+
+    std::cout << "Grid-stride max error: "
+              << maxError << '\n';
+
+    // Reset y again.
+    for (int i = 0; i < N; ++i) {
+        y[i] = 2.0f;
+    }
+
+    // 3. float4 kernel
+    int float4Elements = N / 4;
+    int float4Blocks =
+        (float4Elements + threads - 1) / threads;
+
+    add_float4<<<float4Blocks, threads>>>(N, x, y);
+    cudaDeviceSynchronize();
+
+    maxError = 0.0f;
+
+    for (int i = 0; i < N; ++i) {
+        maxError = std::fmax(maxError, std::fabs(y[i] - 3.0f));
+    }
+
+    std::cout << "float4 max error: "
+              << maxError << '\n';
+
+    cudaFree(x);
+    cudaFree(y);
+
+    return 0;
+}
