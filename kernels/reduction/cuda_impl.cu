@@ -482,4 +482,4 @@ void launch_warp_shuffle_max(
 
 
 
-int main(){}
+int main() {}
