@@ -163,3 +163,33 @@ This demonstrates that the bounds checks support arbitrary input sizes
 without materially affecting performance for large arrays.
 The input size may be irregular, although the shared-memory reduction
 kernels still require a power-of-two block size.
+
+
+### Float32 versus lower-precision accumulation
+
+- Input size: 2^24 elements
+- Block size: 128 threads
+- Implementation: sequential shared-memory reduction
+- Repetitions: 100
+- GPU: NVIDIA L4
+
+| Input type | Accumulator | CPU reference | Result | Absolute error | Time ms | Effective GB/s |
+|:---|:---|---:|---:|---:|---:|---:|
+| float32 | float32 | 556.690 | 556.690 | 0.000104439 | 0.257761 | 260.353 |
+| float16 | float32 | 556.427 | 556.427 | 0.0000436306 | 0.0833411 | 402.616 |
+| float16 | float16 | 556.427 | 556.000 | 0.427080 | 0.0830157 | 404.194 |
+
+FP16 storage with FP32 accumulation provided the best balance between
+performance and numerical accuracy. It reduced input storage from four
+bytes to two bytes per element while keeping accumulation error very
+small.
+
+Using FP16 for both input and accumulation provided almost no additional
+speedup compared with FP32 accumulation, but increased the accumulation
+error by approximately 9,800 times.
+
+The experiment also separated input quantization from accumulation error.
+Converting the original input to FP16 changed the reference sum by
+0.262696 before GPU accumulation was performed.
+=> Lower-precision storage + float32 accumulation = usually sensible
+=> Lower-precision storage + float16 accumulation = much riskier for sums

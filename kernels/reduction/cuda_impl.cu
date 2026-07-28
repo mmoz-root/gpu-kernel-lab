@@ -1,10 +1,10 @@
-// reduction.cu
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math_constants.h>
 
 #include <algorithm>
 #include <cmath>
-#include <math_constants.h>
 #include <cstdlib>
 #include <iostream>
 
@@ -300,6 +300,158 @@ void launch_sequential_max(const float* x, float* output, float* partials, int n
 
 
 
+
+
+// FP16 input, FP32 accumulation
+
+__global__ void sequential_sum_f16_f32_stage(
+    const __half* input,
+    float* partials,
+    int n
+) {
+    extern __shared__ float shared[];
+
+    int tid = threadIdx.x;
+    int index = blockIdx.x * blockDim.x + tid;
+    int grid_stride = blockDim.x * gridDim.x;
+
+    float local_sum = 0.0f;
+
+    while (index < n) {
+        local_sum += __half2float(input[index]);
+        index += grid_stride;
+    }
+
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partials[blockIdx.x] = shared[0];
+    }
+}
+
+
+void launch_sequential_sum_f16_f32(
+    const __half* input,
+    float* output,
+    float* partials,
+    int n,
+    int threads
+) {
+    int blocks = std::min(
+        (n + threads - 1) / threads,
+        MAX_BLOCKS
+    );
+
+    sequential_sum_f16_f32_stage<<<
+        blocks,
+        threads,
+        threads * sizeof(float)
+    >>>(
+        input,
+        partials,
+        n
+    );
+
+    // Partials are already float32, so reuse the existing
+    // float32 sequential reduction for the second stage.
+    sequential_sum_stage<<<
+        1,
+        threads,
+        threads * sizeof(float)
+    >>>(
+        partials,
+        output,
+        blocks
+    );
+}
+
+
+// FP16 input, FP16 accumulation
+
+__global__ void sequential_sum_f16_f16_stage(
+    const __half* input,
+    __half* partials,
+    int n
+) {
+    extern __shared__ __half half_shared[];
+
+    int tid = threadIdx.x;
+    int index = blockIdx.x * blockDim.x + tid;
+    int grid_stride = blockDim.x * gridDim.x;
+
+    __half local_sum = __float2half(0.0f);
+
+    while (index < n) {
+        local_sum = __hadd(
+            local_sum,
+            input[index]
+        );
+
+        index += grid_stride;
+    }
+
+    half_shared[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            half_shared[tid] = __hadd(
+                half_shared[tid],
+                half_shared[tid + stride]
+            );
+        }
+
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partials[blockIdx.x] = half_shared[0];
+    }
+}
+
+
+void launch_sequential_sum_f16_f16(
+    const __half* input,
+    __half* output,
+    __half* partials,
+    int n,
+    int threads
+) {
+    int blocks = std::min(
+        (n + threads - 1) / threads,
+        MAX_BLOCKS
+    );
+
+    sequential_sum_f16_f16_stage<<<
+        blocks,
+        threads,
+        threads * sizeof(__half)
+    >>>(
+        input,
+        partials,
+        n
+    );
+
+    sequential_sum_f16_f16_stage<<<
+        1,
+        threads,
+        threads * sizeof(__half)
+    >>>(
+        partials,
+        output,
+        blocks
+    );
+}
+
 // Warp-shuffle reduction
 
 __device__
@@ -509,6 +661,20 @@ float cpu_max(
     return result;
 }
 
+double cpu_half_sum_for_precision(
+    const __half* input,
+    int n
+) {
+    double result = 0.0;
+
+    for (int i = 0; i < n; ++i) {
+        result += static_cast<double>(
+            __half2float(input[i])
+        );
+    }
+
+    return result;
+}
 
 
 // Benchmarking
@@ -643,6 +809,162 @@ void run_benchmark(
 
 
 
+float benchmark_f32_accumulation(
+    const float* input,
+    float* output,
+    float* partials,
+    int n,
+    int threads,
+    int repetitions
+) {
+    for (int i = 0; i < 5; ++i) {
+        launch_sequential_sum(
+            input,
+            output,
+            partials,
+            n,
+            threads
+        );
+    }
+
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+
+    for (int i = 0; i < repetitions; ++i) {
+        launch_sequential_sum(
+            input,
+            output,
+            partials,
+            n,
+            threads
+        );
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float total_ms;
+    cudaEventElapsedTime(&total_ms, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return total_ms / repetitions;
+}
+
+
+float benchmark_f16_f32_accumulation(
+    const __half* input,
+    float* output,
+    float* partials,
+    int n,
+    int threads,
+    int repetitions
+) {
+    for (int i = 0; i < 5; ++i) {
+        launch_sequential_sum_f16_f32(
+            input,
+            output,
+            partials,
+            n,
+            threads
+        );
+    }
+
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+
+    for (int i = 0; i < repetitions; ++i) {
+        launch_sequential_sum_f16_f32(
+            input,
+            output,
+            partials,
+            n,
+            threads
+        );
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float total_ms;
+    cudaEventElapsedTime(&total_ms, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return total_ms / repetitions;
+}
+
+
+float benchmark_f16_f16_accumulation(
+    const __half* input,
+    __half* output,
+    __half* partials,
+    int n,
+    int threads,
+    int repetitions
+) {
+    for (int i = 0; i < 5; ++i) {
+        launch_sequential_sum_f16_f16(
+            input,
+            output,
+            partials,
+            n,
+            threads
+        );
+    }
+
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    cudaEventCreate(&start);
+
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+
+    for (int i = 0; i < repetitions; ++i) {
+        launch_sequential_sum_f16_f16(
+            input,
+            output,
+            partials,
+            n,
+            threads
+        );
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float total_ms;
+    cudaEventElapsedTime(&total_ms, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return total_ms / repetitions;
+}
+
+
+
+
 int main(
     int argc,
     char** argv)
@@ -677,6 +999,10 @@ int main(
     float* output;
     float* partials;
 
+    __half* half_input;
+    __half* half_output;
+    __half* half_partials;
+
     std::size_t input_bytes =
         static_cast<std::size_t>(n)
         * sizeof(float);
@@ -700,6 +1026,21 @@ int main(
         partial_bytes
     );
 
+    cudaMallocManaged(
+        &half_input,
+        static_cast<size_t>(n) * sizeof(__half)
+    );
+    
+    cudaMallocManaged(
+        &half_output,
+        sizeof(__half)
+    );
+    
+    cudaMallocManaged(
+        &half_partials,
+        MAX_BLOCKS * sizeof(__half)
+    );
+
     // Mixed positive and negative values.
     for (int i = 0; i < n; ++i) {
         x[i] = std::sin(
@@ -707,12 +1048,21 @@ int main(
             * 0.001f
         );
     }
+    for (int i = 0; i < n; ++i) {
+        half_input[i] = __float2half(x[i]);
+    }
 
     double expected_sum =
         cpu_sum(x, n);
 
     float expected_max =
         cpu_max(x, n);
+
+    double expected_half_sum =
+        cpu_half_sum_for_precision(
+        half_input,
+        n
+    );
 
     std::cout
         << "N: "
@@ -835,21 +1185,158 @@ int main(
         repetitions,
         expected_max
     );
+        // Accumulation precision experiment
 
-    // Minimal runtime error check.
-    cudaError_t error =
-        cudaDeviceSynchronize();
+        int precision_repetitions = 100;
 
-    if (error != cudaSuccess) {
-        std::cerr
-            << "CUDA error: "
-            << cudaGetErrorString(error)
+        float f32_time =
+            benchmark_f32_accumulation(
+                x,
+                output,
+                partials,
+                n,
+                threads_per_block,
+                precision_repetitions
+            );
+    
+        float f32_result = output[0];
+    
+    
+        float f16_f32_time =
+            benchmark_f16_f32_accumulation(
+                half_input,
+                output,
+                partials,
+                n,
+                threads_per_block,
+                precision_repetitions
+            );
+    
+        float f16_f32_result = output[0];
+    
+    
+        float f16_f16_time =
+            benchmark_f16_f16_accumulation(
+                half_input,
+                half_output,
+                half_partials,
+                n,
+                threads_per_block,
+                precision_repetitions
+            );
+    
+        float f16_f16_result =
+            __half2float(half_output[0]);
+    
+    
+        double f32_bandwidth =
+            (static_cast<double>(n) * sizeof(float))
+            / (f32_time * 1.0e6);
+    
+        double f16_f32_bandwidth =
+            (static_cast<double>(n) * sizeof(__half))
+            / (f16_f32_time * 1.0e6);
+    
+        double f16_f16_bandwidth =
+            (static_cast<double>(n) * sizeof(__half))
+            / (f16_f16_time * 1.0e6);
+    
+    
+        std::cout
+            << "\nAccumulation precision experiment\n"
+            << "Float32 CPU reference: "
+            << expected_sum
+            << "\n"
+            << "Float16 CPU reference: "
+            << expected_half_sum
+            << "\n"
+            << "Input quantization difference: "
+            << std::fabs(
+                   expected_sum
+                   - expected_half_sum
+               )
             << "\n";
-    }
-
-    cudaFree(x);
-    cudaFree(output);
-    cudaFree(partials);
-
-    return 0;
+    
+    
+        std::cout
+            << "\nFloat32 input, float32 accumulation:\n"
+            << "  Result: "
+            << f32_result
+            << "\n"
+            << "  Absolute error: "
+            << std::fabs(
+                   static_cast<double>(f32_result)
+                   - expected_sum
+               )
+            << "\n"
+            << "  Average time: "
+            << f32_time
+            << " ms\n"
+            << "  Input bandwidth: "
+            << f32_bandwidth
+            << " GB/s\n";
+    
+    
+        std::cout
+            << "\nFloat16 input, float32 accumulation:\n"
+            << "  Result: "
+            << f16_f32_result
+            << "\n"
+            << "  Absolute error: "
+            << std::fabs(
+                   static_cast<double>(f16_f32_result)
+                   - expected_half_sum
+               )
+            << "\n"
+            << "  Average time: "
+            << f16_f32_time
+            << " ms\n"
+            << "  Input bandwidth: "
+            << f16_f32_bandwidth
+            << " GB/s\n";
+    
+    
+        std::cout
+            << "\nFloat16 input, float16 accumulation:\n"
+            << "  Result: "
+            << f16_f16_result
+            << "\n"
+            << "  Absolute error: "
+            << std::fabs(
+                   static_cast<double>(f16_f16_result)
+                   - expected_half_sum
+               )
+            << "\n"
+            << "  Average time: "
+            << f16_f16_time
+            << " ms\n"
+            << "  Input bandwidth: "
+            << f16_f16_bandwidth
+            << " GB/s\n";
+    
+    
+        // Minimal CUDA error check.
+    
+        cudaError_t error =
+            cudaDeviceSynchronize();
+    
+        if (error != cudaSuccess) {
+            std::cerr
+                << "CUDA error: "
+                << cudaGetErrorString(error)
+                << "\n";
+        }
+    
+    
+        // Free every allocation exactly once.
+    
+        cudaFree(x);
+        cudaFree(output);
+        cudaFree(partials);
+    
+        cudaFree(half_input);
+        cudaFree(half_output);
+        cudaFree(half_partials);
+    
+        return 0;
 }
