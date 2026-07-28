@@ -27,7 +27,7 @@ void naive_max(const float* x, float* output, int64_t n) {
     if(blockIdx.x == 0 && threadIdx.x == 0) {
         float result = x[0];
 
-        fot(int64_t i = 1; i<n; ++i) {
+        for(int64_t i = 1; i<n; ++i) {
             if(x[i] > result) {
                 result = x[i];
             }
