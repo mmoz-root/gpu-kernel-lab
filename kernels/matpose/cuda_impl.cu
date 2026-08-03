@@ -3,6 +3,9 @@
 #include <vector>
 #include <cassert>
 
+
+constexpr int TILE_SIZE = 32;
+
 __global__
 void matpose_naive(const float* input, float* output, int rows, int cols) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -25,7 +28,73 @@ void launch_matpose_naive(const float* input, float* output, int rows, int cols)
 
     matpose_naive<<<grid, block>>>(input, output, rows, cols);
 
-}   
+}
+
+
+__global__
+void matpose_tiled(const float* input, float* output, int rows, int cols) {
+    __shared__ float tile[TILE_SIZE][TILE_SIZE];
+
+    int input_col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int input_row = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    if (input_col < cols && input_row < rows) {
+        tile[threadIdx.y][threadIdx.x] = input[input_row * cols + input_col];
+    }
+
+    __syncthreads();
+
+    int output_col = blockIdx.y * TILE_SIZE + threadIdx.x;
+    int output_row = blockIdx.x * TILE_SIZE + threadIdx.y;
+
+    if (output_col < rows && output_row < cols) {
+        output[output_row * rows + output_col] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+
+void launch_matpose_tiled(const float* input, float* output, int rows, int cols) {
+    dim3 block(TILE_SIZE, TILE_SIZE);
+
+    dim3 grid(
+        ((cols + TILE_SIZE - 1)/TILE_SIZE),
+        ((rows + TILE_SIZE - 1)/TILE_SIZE)
+    );
+
+    matpose_tiled<<<grid, block>>>(input, output, rows, cols);
+}
+
+
+__global__
+void matpose_tiled_padded(const float* input, float* output, int rows, int cols) {
+    __shared__ float tile[TILE_SIZE][TILE_SIZE+1];
+
+    int input_col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int input_row = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    if (input_col < cols && input_row < rows) {
+        tile[threadIdx.y][threadIdx.x] = input[input_row * cols + input_col];
+    }
+
+    __syncthreads();
+
+    int output_col = blockIdx.y * TILE_SIZE + threadIdx.x;
+    int output_row = blockIdx.x * TILE_SIZE + threadIdx.y;
+
+    if (output_col < rows && output_row < cols) {
+        output[output_row * rows + output_col] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+
+void launch_matpose_tiled_padded(const float* input, float* output, int rows, int cols) {
+    dim3 block(TILE_SIZE, TILE_SIZE);
+
+    dim3 grid(
+        ((cols + TILE_SIZE - 1)/TILE_SIZE),
+        ((rows + TILE_SIZE - 1)/TILE_SIZE)
+    );
+
+    matpose_tiled_padded<<<grid, block>>>(input, output, rows, cols);
+}
 
 int main() {
     int rows = 2;
@@ -47,8 +116,9 @@ int main() {
 
     cudaMemcpy(d_input, input.data(), bytes, cudaMemcpyHostToDevice);
     
-
-    launch_matpose_naive(d_input, d_output, rows, cols);
+    // launch_matpose_naive(d_input, d_output, rows, cols);
+    // launch_matpose_tiled(d_input, d_output, rows, cols);
+    launch_matpose_tiled_padded(d_input, d_output, rows, cols);
     
     cudaMemcpy(output.data(), d_output, bytes, cudaMemcpyDeviceToHost);
 
