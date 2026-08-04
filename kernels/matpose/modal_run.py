@@ -1,4 +1,4 @@
-"""Compile and run matrix-transpose CUDA kernels on Modal."""
+"""Compile and run matrix-transpose CUDA experiments on Modal."""
 
 from pathlib import Path
 import subprocess
@@ -35,7 +35,11 @@ app = modal.App("matpose-lab")
     gpu="L4",
     timeout=5 * 60,
 )
-def run_cuda():
+def run_cuda(
+    rows: int,
+    cols: int,
+    repetitions: int,
+):
     executable = "/tmp/matpose"
 
     print("Compiling CUDA program...")
@@ -57,11 +61,24 @@ def run_cuda():
     print("Running CUDA program...")
 
     subprocess.run(
-        [executable],
+        [
+            executable,
+            str(rows),
+            str(cols),
+            str(repetitions),
+        ],
         check=True,
     )
 
 
 @app.local_entrypoint()
-def main():
-    run_cuda.remote()
+def main(
+    rows: int = 4096,
+    cols: int = 4096,
+    repetitions: int = 100,
+):
+    run_cuda.remote(
+        rows,
+        cols,
+        repetitions,
+    )
