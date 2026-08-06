@@ -1,12 +1,14 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <system_error>
 #include <vector>
 #include <limits>
+#include <string>
+
 
 
 void check_cuda(
@@ -274,15 +276,270 @@ void cpu_softmax(
 }
 
 
-int main()
-{
-    constexpr int rows = 2;
-    constexpr int cols = 3;
 
-    std::vector<float> input = {
-        1.0f, 2.0f, 3.0f,
-        4.0f, 5.0f, 6.0f,
-    };
+
+__global__
+void block_softmax(
+    const float* input,
+    float* output,
+    int rows,
+    int cols
+) {
+    extern __shared__ float shared[];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (row >= rows) return;
+
+    int row_start = row*cols;
+
+    // each thread finds its local max
+    float local_max = -CUDART_INF_F;
+
+    for(int col=tid; col < cols; col += blockDim.x) {
+        local_max = fmaxf(local_max, input[row_start+col]);
+    }
+
+    // reduce the thread local maxima
+    shared[tid] = local_max;
+    __syncthreads();
+
+    for(int stride = blockDim.x/2; stride>0; stride /= 2) {
+        if(tid < stride) {
+            shared[tid] = fmaxf(shared[tid], shared[tid+stride]);
+        }
+        __syncthreads();
+    }
+
+    float row_max = shared[0];
+    __syncthreads();
+
+
+    // compute numerators and thread-local sums
+    float local_sum = 0.0f;
+
+    for(int col = tid; col<cols; col+=blockDim.x) {
+        int index = row_start + col;
+
+        float numerator = expf(input[index] - row_max);
+
+        output[index] = numerator;
+
+        local_sum += numerator;
+    }
+
+    // reduce thread local sums
+
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for(int stride = blockDim.x / 2; stride>0; stride /= 2) {
+        if(tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float denominator = shared[0];
+
+    float inverse_denominator = 1.0f / denominator;
+
+    for(int col = tid; col < cols; col += blockDim.x) {
+        int index = row_start + col;
+
+        output[index] *= inverse_denominator;
+    }
+}
+void launch_block_softmax(
+    const float* input,
+    float* output,
+    int rows,
+    int cols)
+{
+    constexpr int threads = 256;
+
+    int blocks = rows;
+
+    std::size_t shared_bytes =
+        threads * sizeof(float);
+
+    block_softmax<<<
+        blocks,
+        threads,
+        shared_bytes
+    >>>(
+        input,
+        output,
+        rows,
+        cols
+    );
+}
+
+
+
+// reusable device helpers for warp design
+__device__
+float warp_reduce_max(float value) {
+    constexpr unsigned mask = 0xffffffffu;
+
+    for(int offs = 16; offs > 0; offs /= 2) {
+        value = fmaxf(value, __shfl_down_sync(mask, value, offs));
+    }
+    return __shfl_sync(mask, value, 0);
+}
+
+__device__
+float warp_reduce_sum(float value) {
+    constexpr unsigned mask = 0xffffffffu;
+
+    for (int offset = 16; offset > 0; offset /= 2) {
+        value += __shfl_down_sync(
+            mask,
+            value,
+            offset
+        );
+    }
+
+    return __shfl_sync(
+        mask,
+        value,
+        0
+    );
+}
+
+__global__
+void warp_softmax(const float* input, float* output, int rows, int cols) {
+    constexpr int warp_size = 32;
+
+    int warp_in_block = threadIdx.x / warp_size;
+
+    int lane = threadIdx.x % warp_size;
+
+    int warps_per_block = blockDim.x / warp_size;
+
+    int row = blockIdx.x * warps_per_block + warp_in_block;
+
+    if(row >= rows) return;
+
+    int row_start = row * cols;
+
+    float local_max = -CUDART_INF_F;
+
+    for(int col = lane; col < cols; col += warp_size) {
+        local_max = fmaxf(local_max, input[row_start + col]);
+    }
+
+    float row_max = warp_reduce_max(local_max);
+
+    float local_sum = 0.0f;
+
+    for(int col = lane; col < cols; col += warp_size) {
+        int index = row_start + col;
+
+        float numerator = expf(input[index] - row_max);
+
+        output[index] = numerator;
+        local_sum += numerator;
+    }
+
+    float denominator = warp_reduce_sum(local_sum);
+
+    float inverse_denominator = 1.0f / denominator;
+
+    for(int col = lane; col<cols; col+=warp_size) {
+        int index = row_start + col;
+
+        output[index] *= inverse_denominator;
+    }
+}
+void launch_warp_softmax(const float* input, float* output, int rows, int cols) {
+    int threads = 256;
+    int warps_per_block = threads / 32;
+    int blocks = (rows + warps_per_block - 1) / warps_per_block;
+
+    warp_softmax<<<blocks, threads>>>(input, output, rows, cols);
+}
+
+
+
+float max_abs_error(
+    const std::vector<float>&actual,
+    const std::vector<float>&expected
+) {
+    float max_error = 0.0f;
+
+    for(std::size_t i = 0; i < actual.size(); ++i) {
+        max_error = std::max(max_error, std::abs(actual[i] - expected[i]));
+    }
+    return max_error;
+}
+
+std::vector<float> make_test_input(int rows, int cols) {
+    std::size_t element_count = static_cast<std::size_t>(rows)*cols;
+
+    std::vector<float> input(element_count);
+
+    for(std::size_t i = 0; i<element_count; ++i) {
+        input[i] = static_cast<float>(static_cast<int>(i%17) -8);
+    }
+
+    return input;
+}
+std::vector<float> make_large_logit_input(int rows, int cols) {
+    std::vector<float> input = make_test_input(rows, cols);
+
+    for(float& value : input) {
+        value += 10000.0f;
+    }
+    return input;    
+}
+
+
+template <typename LaunchFunction>
+void warmup_cuda_kernel(LaunchFunction launch, int warmups) {
+    for(int i = 0; i<warmups; ++i) {
+        launch();
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+template <typename LaunchFunction>
+float benchmark_cuda_kernel(LaunchFunction launch, int warmups, int repetitions) {
+    warmup_cuda_kernel(launch, warmups);
+
+    cudaEvent_t start, stop;
+    
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start, 0));
+
+    for(int i = 0; i < repetitions; i++) {
+        launch();
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop, 0));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    return total_ms / repetitions;
+}
+bool run_correctness_test(const std::vector<float>& input,
+int rows, int cols, int warmups, int repetitions) {
+
+    std::cout << "Correctness test: rows="
+    << rows
+    << ", cols="
+    << cols
+    << "\n";
 
     std::vector<float> expected;
 
@@ -293,7 +550,7 @@ int main()
         cols
     );
 
-    std::cout << "CPU reference:\n";
+    /*std::cout << "CPU reference:\n";
 
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
@@ -303,7 +560,8 @@ int main()
         }
 
         std::cout << "\n";
-    }
+    }*/
+
     std::size_t element_count =
     static_cast<std::size_t>(rows) * cols;
 
@@ -372,7 +630,7 @@ int main()
         cudaMemcpyDeviceToHost
     ));
 
-    std::cout << "GPU reference:\n";
+    /*std::cout << "Naive Softmax Output:\n";
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
             std::cout
@@ -381,16 +639,9 @@ int main()
         }
 
         std::cout << "\n";
-    }
+    }*/
 
-    float max_error = 0.0f;
-
-    for (std::size_t i = 0; i < element_count; ++i) {
-        max_error = std::max(
-            max_error,
-            std::abs(actual[i] - expected[i])
-        );
-    }
+    float max_error = max_abs_error(actual, expected);
 
     bool passed = max_error < 1e-5f;
 
@@ -403,16 +654,185 @@ int main()
         << "Naive softmax: "
         << (passed ? "PASSED" : "FAILED")
         << "\n";
+    auto launch_naive = [&]() {
+        launch_naive_softmax(d_input, d_output, d_row_max, d_numerator, d_row_sum, rows, cols);
+    };
+ 
+    float naive_ms =
+        benchmark_cuda_kernel(launch_naive, warmups, repetitions);
+ 
+    std::cout << "Naive avg time: "
+              << naive_ms
+              << " ms\n";
 
+
+    launch_block_softmax(
+        d_input,
+        d_output,
+        rows,
+        cols
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(
+        actual.data(),
+        d_output,
+        matrix_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+    /*std::cout << "Block softmax output:\n";
+
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            std::cout
+                << actual[row * cols + col]
+                << " ";
+        }
+    
+        std::cout << "\n";
+    }*/
+
+    float block_max_error = max_abs_error(actual, expected);
+
+    bool block_passed =
+        block_max_error < 1e-5f;
+
+    std::cout
+        << "Block softmax max error: "
+        << block_max_error
+        << "\n";
+
+    std::cout
+        << "Block softmax: "
+        << (block_passed ? "PASSED" : "FAILED")
+        << "\n";
+    auto launch_block = [&]() {
+        launch_block_softmax(d_input, d_output, rows, cols);
+    };
+ 
+    float block_ms =
+        benchmark_cuda_kernel(launch_block, warmups, repetitions);
+ 
+    std::cout << "Block avg time: "
+              << block_ms
+              << " ms\n";
+
+    launch_warp_softmax(d_input, d_output, rows, cols);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(actual.data(), d_output, matrix_bytes, cudaMemcpyDeviceToHost));
+
+
+    /*std::cout << "Warp softmax output:\n";
+    for(int row = 0; row<rows; ++row) {
+        for(int col = 0; col<cols; ++col) {
+            std::cout << actual[row*cols + col] << " ";
+        }
+        std::cout << "\n";
+    }*/
+
+
+    float warp_max_error = max_abs_error(actual, expected);
+    bool warp_passed = warp_max_error < 1e-5f;
+
+    std::cout << "Warp softmax max error: "
+    << warp_max_error
+    << "\n";
+
+    std::cout << "Warp softmax: "
+    << (warp_passed ? "PASSED" : "FAILED")
+    << "\n";
+
+   
+    auto launch_warp = [&]() {
+        launch_warp_softmax(d_input, d_output, rows, cols);
+    };
+    float warp_ms = benchmark_cuda_kernel(launch_warp, warmups, repetitions);
+
+    std::cout << "Warp avg time: "
+    << warp_ms
+    << " ms\n";
+
+    passed = passed && block_passed && warp_passed;
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_output));
     CUDA_CHECK(cudaFree(d_row_max));
     CUDA_CHECK(cudaFree(d_numerator));
     CUDA_CHECK(cudaFree(d_row_sum));
 
-    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+    return passed;
 }
 
 
 
+int main(int argc, char* argv[]) {
+    if (argc != 1 && argc != 4) {
+        std::cerr
+            << "Usage: "
+            << argv[0]
+            << " [rows cols repetitions]\n";
+ 
+        return EXIT_FAILURE;
+    }
+
+    if (argc == 4) {
+        int rows = std::stoi(argv[1]);
+        int cols = std::stoi(argv[2]);
+        int repetitions = std::stoi(argv[3]);
+        int warmups = 10;
+ 
+        if (rows <= 0 || cols <= 0 || repetitions <= 0) {
+            std::cerr
+                << "rows, cols, and repetitions must be positive\n";
+            return EXIT_FAILURE;
+        }
+ 
+        std::vector<float> input =
+            make_test_input(rows, cols);
+ 
+        bool passed = run_correctness_test(
+            input,
+            rows,
+            cols,
+            warmups,
+            repetitions
+        );
+ 
+        return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+ 
+    int rows = 10;
+    int repetitions = 100;
+    int warmups = 10;
+
+    std::vector<int> widths = {
+        1, 3, 31, 32, 33,
+        128, 256, 512, 1000, 1024,
+        2048, 4096, 8192
+    };
+    
+    bool all_passed = true;
+    for(int cols : widths) {
+        std::vector<float> input = make_test_input(rows, cols);
+
+        bool passed = run_correctness_test(input, rows, cols, warmups, repetitions);
+
+        all_passed = all_passed && passed;
+    }
+
+    int large_cols = 33;
+
+    std::cout<< "Large positive logits\n";
+
+    std::vector<float> large_input = make_large_logit_input(rows, large_cols);
+
+    bool large_passed = run_correctness_test(large_input, rows, large_cols, warmups, repetitions);
+
+    all_passed = all_passed && large_passed;
+
+    return all_passed ? EXIT_SUCCESS : EXIT_FAILURE;
+}
 

@@ -33,7 +33,7 @@ app = modal.App("softmax-lab")
     gpu="L4",
     timeout=5 * 60,
 )
-def run_cuda():
+def run_cuda(rows: int, cols: int, repetitions: int):
     executable = "/tmp/softmax"
 
     subprocess.run(
@@ -51,11 +51,14 @@ def run_cuda():
     )
 
     subprocess.run(
-        [executable],
+        [executable,
+        str(rows),
+        str(cols),
+        str(repetitions)],
         check=True,
     )
 
 
 @app.local_entrypoint()
-def main():
-    run_cuda.remote()
+def main(rows: int, cols: int, repetitions: int):
+    run_cuda.remote(rows, cols, repetitions)
