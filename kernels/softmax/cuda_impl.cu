@@ -462,6 +462,108 @@ void launch_warp_softmax(const float* input, float* output, int rows, int cols) 
 }
 
 
+__device__
+float max_float4(float4 val) {
+    return fmaxf(fmaxf(val.x, val.y), fmaxf(val.z, val.w));
+}
+__device__
+float sum_float4(float4 val) {
+    return (val.x + val.y) + (val.z + val.w);
+}
+
+__global__
+void vectorized_block_softmax(const float* input, float* output, int rows, int cols) {
+    extern __shared__ float shared[];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if(row >= rows) return;
+
+    int row_start = row*cols;
+
+    int vector_count = cols/4;
+
+    const float4* input4 = reinterpret_cast<const float4*>(input+row_start);
+
+    float local_max = -CUDART_INF_F;
+
+    for(int vec = tid; vec < vector_count; vec+=blockDim.x) {
+        float4 values = input4[vec];
+        local_max = fmaxf(local_max, max_float4(values));
+    }
+
+    shared[tid] = local_max;
+    __syncthreads();
+
+    for(int stride = blockDim.x/2; stride > 0; stride/=2) {
+        if(tid < stride) {
+            shared[tid] = fmaxf(shared[tid], shared[tid+stride]);
+        }
+        __syncthreads();
+    }
+    float row_max = shared[0];
+
+    __syncthreads();
+
+    float4* output4 = reinterpret_cast<float4*>(output+row_start);
+
+    float local_sum = 0.0f;
+
+    for(int vec = tid; vec < vector_count; vec+=blockDim.x) {
+        float4 values = input4[vec];
+
+        float4 numerators;
+
+        numerators.x = expf(values.x - row_max);
+        numerators.y = expf(values.y - row_max);
+        numerators.z = expf(values.z - row_max);
+        numerators.w = expf(values.w - row_max);
+
+        output4[vec] = numerators;
+        local_sum += sum_float4(numerators);
+    }
+
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for(int stride = blockDim.x/2; stride > 0; stride/=2) {
+        if(tid < stride) {
+            shared[tid] += shared[tid+stride];
+        }
+        __syncthreads();
+    }
+
+    float denominator = shared[0];
+
+    float inverse_denominator = 1.0f / denominator;
+
+    for(int vec = tid; vec < vector_count; vec+=blockDim.x) {
+        float4 values = output4[vec];
+        values.x *= inverse_denominator;
+        values.y *= inverse_denominator;
+        values.z *= inverse_denominator;
+        values.w *= inverse_denominator;
+       output4[vec] = values;
+    }
+}
+
+void launch_vectorized_softmax(const float* input, float* output, int rows, int cols) {
+    if (cols % 4 != 0) {
+        launch_block_softmax(input, output, rows, cols);
+        return;
+    }
+
+    int threads = 256;
+    int blocks = rows;
+
+    std::size_t shared_bytes = threads * sizeof(float);
+
+    vectorized_block_softmax<<<blocks, threads, shared_bytes>>>(input, output, rows, cols);
+
+}
+
+
 
 float max_abs_error(
     const std::vector<float>&actual,
@@ -532,6 +634,10 @@ float benchmark_cuda_kernel(LaunchFunction launch, int warmups, int repetitions)
 
     return total_ms / repetitions;
 }
+
+
+
+
 bool run_correctness_test(const std::vector<float>& input,
 int rows, int cols, int warmups, int repetitions) {
 
@@ -756,7 +862,36 @@ int rows, int cols, int warmups, int repetitions) {
     << warp_ms
     << " ms\n";
 
-    passed = passed && block_passed && warp_passed;
+
+    launch_vectorized_softmax(d_input, d_output, rows, cols);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(actual.data(), d_output, matrix_bytes, cudaMemcpyDeviceToHost));
+    
+    float vectorized_max_error = max_abs_error(actual, expected);
+
+    bool vectorized_passed = vectorized_max_error < 1e-5f;
+
+    std::cout << "Vectorized softmax max error: "
+    << vectorized_max_error
+    << "\n";
+
+    std::cout << "Vectorized softmax: "
+    << (vectorized_passed ? "PASSED" : "FAILED")
+    << "\n";
+
+    auto launch_vectorized = [&]() {
+        launch_vectorized_softmax(d_input, d_output, rows, cols);
+    };
+    float vectorized_ms = benchmark_cuda_kernel(launch_vectorized, warmups, repetitions);
+
+    std::cout << "Vectorized avg time: "
+    << vectorized_ms
+    << " ms\n";
+    
+    passed = passed && block_passed && warp_passed && vectorized_passed;
+
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_output));
     CUDA_CHECK(cudaFree(d_row_max));
