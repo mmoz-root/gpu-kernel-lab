@@ -1,5 +1,11 @@
 #include <cuda_runtime.h>
 
+#ifdef TORCH_EXTENSION_NAME
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -126,6 +132,210 @@ void launch_basic_rms_norm(
     );
 }
 
+
+
+__device__ 
+float warp_reduce_sum(float val) {
+    constexpr unsigned full_max = 0xffffffffu;
+
+    for(int offs = 16; offs > 0; offs/=2) {
+        val += __shfl_down_sync(full_max, val, offs);
+    }
+    return val;
+}
+
+
+__global__
+void optimized_rms_norm(const float* input, const float* weight, float* output,
+                        int rows, int cols, float eps) {
+    extern __shared__ float warp_sums[];
+
+    constexpr int warp_size = 32;
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if(row >= rows) return;
+
+    int lane = tid % warp_size;
+    int warp_id = tid / warp_size;
+    int warp_count = blockDim.x / warp_size;
+
+    int row_start = row * cols;
+    
+    float local_sum_sqr = 0.0f;
+
+    for(int col = tid; col<cols; col+=blockDim.x){
+        float val = input[row_start + col];
+        local_sum_sqr += val*val;
+    }
+
+    float warp_sum = warp_reduce_sum(local_sum_sqr);
+
+    if(lane == 0) warp_sums[warp_id] = warp_sum;
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float block_sum = lane < warp_count ? warp_sums[lane] : 0.0f;
+
+        block_sum = warp_reduce_sum(block_sum);
+
+        if(lane==0) {
+            float mean_sqr = block_sum / static_cast<float>(cols);
+            warp_sums[0] = rsqrtf(mean_sqr + eps);
+        }
+    }
+    __syncthreads();
+
+    float reciprocal_rms = warp_sums[0];
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        int index = row_start + col;
+
+        output[index] =
+            input[index]
+            * reciprocal_rms
+            * weight[col];
+    }
+}
+
+void launch_optimized_rms_norm(
+    const float* input, const float* weight, float* output,
+    int rows, int cols, float eps
+) {
+    constexpr int threads = 256;
+    constexpr int warp_size = 32;
+
+    int blocks = rows;
+    int warp_count = threads / warp_size;
+
+    std::size_t shared_bytes = warp_count * sizeof(float);
+
+    optimized_rms_norm<<<blocks, threads, shared_bytes>>>(
+        input, weight, output,
+        rows, cols, eps
+    );
+}
+
+#ifdef TORCH_EXTENSION_NAME
+void launch_optimized_rms_norm_stream(
+    const float* input,
+    const float* weight,
+    float* output,
+    int rows, int cols, float eps,
+    cudaStream_t stream
+) {
+    constexpr int threads = 256;
+    constexpr int warp_size = 32;
+
+    int blocks = rows;
+    int warp_count = threads / warp_size;
+
+    std::size_t shared_bytes = warp_count * sizeof(float);
+
+    optimized_rms_norm<<<blocks, threads, shared_bytes, stream>>>(
+        input, weight, output,
+        rows, cols, eps
+    );
+}
+
+torch::Tensor rms_norm_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    double eps
+) {
+    TORCH_CHECK(
+        input.is_cuda(),
+        "input must be a CUDA tensor"
+    );
+
+    TORCH_CHECK(
+        weight.is_cuda(),
+        "weight must be a CUDA tensor"
+    );
+
+    TORCH_CHECK(
+        input.scalar_type() == torch::kFloat32,
+        "input must have dtype float32"
+    );
+
+    TORCH_CHECK(
+        weight.scalar_type() == torch::kFloat32,
+        "weight must have dtype float32"
+    );
+
+    TORCH_CHECK(
+        input.dim() >= 1,
+        "input must have at least one dimension"
+    );
+
+    TORCH_CHECK(
+        input.size(-1) > 0,
+        "the normalized dimension must be non-empty"
+    );
+
+    TORCH_CHECK(
+        weight.dim() == 1
+        && weight.size(0) == input.size(-1),
+        "weight must have shape (input.shape[-1],)"
+    );
+
+    TORCH_CHECK(
+        input.device() == weight.device(),
+        "input and weight must be on the same CUDA device"
+    );
+
+    TORCH_CHECK(
+        eps >= 0.0,
+        "eps must be non-negative"
+    );
+
+    torch::Tensor input_contiguous = input.contiguous();
+    torch::Tensor weight_contiguous = weight.contiguous();
+
+    torch::Tensor output = torch::empty_like(input_contiguous);
+
+    int cols = static_cast<int>(input_contiguous.size(-1));
+    int rows = static_cast<int>(input_contiguous.numel() / input_contiguous.size(-1));
+
+    c10::cuda::CUDAGuard device_guard(
+        input_contiguous.device()
+    );
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(
+        input_contiguous.get_device()
+    );
+
+    launch_optimized_rms_norm_stream(
+        input_contiguous.data_ptr<float>(),
+        weight_contiguous.data_ptr<float>(),
+        output.data_ptr<float>(),
+        rows, cols, static_cast<float>(eps),
+        stream
+    );
+    
+    cudaError_t error = cudaGetLastError();
+
+    TORCH_CHECK(
+        error == cudaSuccess,
+        "RMSNorm CUDA kernel launch failed: ",
+        cudaGetErrorString(error)
+    );
+
+    return output;
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    module.def(
+        "forward",
+        &rms_norm_cuda,
+        "RMSNorm forward (CUDA)",
+        pybind11::arg("input"),
+        pybind11::arg("weight"),
+        pybind11::arg("eps") = 1e-6
+    );
+}
+#endif
 
 // host / reference implementation
 void cpu_rms_norm(
@@ -254,13 +464,61 @@ bool check_implementation(
     return passed;
 }
 
+float benchmark_implementation(
+    RmsNormLauncher launcher,
+    const float* d_input,
+    const float* d_weight,
+    float* d_output,
+    int rows, int cols, float eps,
+    int repetitions
+) {
+    constexpr int warmups = 10;
+
+    for(int i = 0; i<warmups; ++i) {
+        launcher(
+            d_input, d_weight, d_output,
+            rows, cols, eps
+        );
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for(int i = 0; i < repetitions; ++i) {
+        launcher(
+            d_input, d_weight, d_output,
+            rows, cols, eps
+        );
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    
+    float total_ms = 0.0f;
+
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    return total_ms / repetitions;
+}
 
 bool run_correctness_test(
     const std::vector<float>& input,
     const std::vector<float>& weight,
     int rows,
     int cols,
-    float eps
+    float eps,
+    int repetitions = 0
 ) {
 
     std::cout << "Correctness test: rows="
@@ -296,12 +554,52 @@ bool run_correctness_test(
                             cudaMemcpyHostToDevice));
 
     bool passed = check_implementation(
-        "basuc rmsnorm",
+        "basic rmsnorm",
         launch_basic_rms_norm,
         d_input, d_weight, d_output,
         actual, expected,
         rows, cols, eps
     );
+    
+    bool optimized_passed = check_implementation(
+        "Optimized RMSNorm",
+        launch_optimized_rms_norm,
+        d_input, d_weight, d_output,
+        actual, expected,
+        rows, cols, eps
+    );
+
+    passed = passed && optimized_passed;
+
+    if(repetitions > 0) {
+        float basic_ms = benchmark_implementation(
+            launch_basic_rms_norm,
+            d_input, d_weight, d_output,
+            rows, cols, eps,
+            repetitions
+        );
+
+        float optimized_ms = benchmark_implementation(
+            launch_optimized_rms_norm,
+            d_input, d_weight, d_output,
+            rows, cols, eps,
+            repetitions
+        );
+
+        float speedup = basic_ms / optimized_ms;
+
+        std::cout
+            << "\nBenchmark\n"
+            << "Basic RMSNorm:     "
+            << basic_ms
+            << " ms\n"
+            << "Optimized RMSNorm: "
+            << optimized_ms
+            << " ms\n"
+            << "Speedup:           "
+            << speedup
+            << "x\n";
+    }
 
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_weight));
@@ -312,6 +610,7 @@ bool run_correctness_test(
 
 
 
+#ifndef TORCH_EXTENSION_NAME
 int main(int argc, char* argv[]) {
     constexpr float eps = 1e-6f;
 
@@ -343,7 +642,7 @@ int main(int argc, char* argv[]) {
         std::vector<float>input = make_test_input(rows, cols);
         std::vector<float>weight = make_test_weight(cols);
 
-        bool passed = run_correctness_test(input, weight, rows, cols, eps);
+        bool passed = run_correctness_test(input, weight, rows, cols, eps, repetitions);
 
         return passed ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -392,3 +691,4 @@ int main(int argc, char* argv[]) {
         ? EXIT_SUCCESS
         : EXIT_FAILURE;
 }
+#endif
