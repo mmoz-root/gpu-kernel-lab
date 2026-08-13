@@ -44,3 +44,15 @@ The speedup decreased as row width increased. At widths 2048 and above,
 the implementations performed nearly identically because reading the
 input twice and writing the output dominated execution time. Optimizing
 the reduction structure did not reduce this global-memory traffic.
+
+### PyTorch CUDA extension
+
+The optimized float32 CUDA kernel was exposed through a forward-only
+PyTorch extension. It launches on PyTorch's current CUDA stream and
+returns a PyTorch-managed output tensor.
+
+For shape 4096 × 1024 on an NVIDIA L4, the extension matched
+`torch.nn.functional.rms_norm` with a maximum absolute error of
+approximately 1.91e-6.
+
+Custom backward/autograd support was not implemented.

@@ -325,7 +325,7 @@ torch::Tensor rms_norm_cuda(
 
     return output;
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     module.def(
         "forward",
         &rms_norm_cuda,
